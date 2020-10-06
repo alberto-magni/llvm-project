@@ -294,22 +294,24 @@ void emitScalarImplementation(ArrayRef<Value> allIvs, FillOp fillOp) {
   nPar > 0 ? O(ivs) = fillOp.value() : O() = fillOp.value();
 }
 
+// Create a padded view into the given `input` tensor using the 'indices'
+// to access the tensor. `skipPadding` lists the dimensions for which no padding
+// is needed e.g. the non-spatial dimensions for convolutions.
 template <typename IndexedValueType>
-Value getConvOpInput(ConvOp convOp, StdIndexedValue im,
-                     MutableArrayRef<Value> imIdx) {
+Value getPaddedInput(Value input, ArrayRef<Value> indices,
+                     ArrayRef<int> skipPadding) {
   // TODO: add a level of indirection to linalg.generic.
-  if (!convOp.padding())
-    return im(imIdx);
+
+  IndexedValueType indexedInput(input);
 
   auto *context = ScopedContext::getContext();
   Value zeroIndex = std_constant_index(0);
   SmallVector<Value, 8> conds;
   SmallVector<Value, 8> clampedImIdx;
-  for (auto iter : llvm::enumerate(imIdx)) {
+  for (auto iter : llvm::enumerate(indices)) {
     int idx = iter.index();
     auto dim = iter.value();
-    // Only need to iterate over the window dimensions.
-    if (idx == 0 || idx == static_cast<int>(imIdx.size()) - 1) {
+    if (is_contained(skipPadding, idx)) {
       clampedImIdx.push_back(dim);
       continue;
     }
@@ -322,7 +324,7 @@ Value getConvOpInput(ConvOp convOp, StdIndexedValue im,
       conds.push_back(leftOutOfBound);
     else
       conds.push_back(conds.back() || leftOutOfBound);
-    Value rightBound = std_dim(convOp.input(), idx);
+    Value rightBound = std_dim(input, idx);
     conds.push_back(conds.back() || (sge(dim, rightBound)));
 
     // When padding is involved, the indices will only be shifted to negative,
@@ -335,9 +337,9 @@ Value getConvOpInput(ConvOp convOp, StdIndexedValue im,
   }
 
   auto &b = ScopedContext::getBuilderRef();
-  Type type = convOp.input().getType().cast<MemRefType>().getElementType();
+  Type type = input.getType().cast<MemRefType>().getElementType();
   Value zero = std_constant(type, b.getZeroAttr(type));
-  Value readInput = im(clampedImIdx);
+  Value readInput = indexedInput(clampedImIdx);
   return conds.empty() ? readInput
                        : (Value)std_select(conds.back(), zero, readInput);
 }
@@ -373,8 +375,10 @@ static void emitScalarImplementation(ArrayRef<Value> allIvs, ConvOp convOp) {
   // which is not allowed by affine.load. Override to use an StdIndexedValue
   // when there is non-zero padding.
   if (hasPadding(convOp)) {
-    StdIndexedValue I(convOp.input());
-    Value paddedInput = getConvOpInput<IndexedValueType>(convOp, I, imIdx);
+    Value paddedInput = getPaddedInput<StdIndexedValue>(
+        convOp.input(), imIdx,
+        /* Only need to pad the window dimensions */
+        {0, static_cast<int>(imIdx.size()) - 1});
     O(oIdx) += F(fIdx) * paddedInput;
   } else {
     IndexedValueType I(convOp.input());
@@ -382,14 +386,32 @@ static void emitScalarImplementation(ArrayRef<Value> allIvs, ConvOp convOp) {
   }
 }
 
+template <typename PoolingOp>
+static bool hasPadding(PoolingOp poolingOp) {
+  for (unsigned i = 0, e = poolingOp.getNumWindowLoops(); i < e; ++i) {
+    if (poolingOp.getLowPad(i) > 0 || poolingOp.getHighPad(i) > 0)
+      return true;
+  }
+  return false;
+}
+
+template <typename IndexedValueType, typename PoolingOp>
+static Value getPoolingInput(PoolingOp op, ArrayRef<Value> inputIndices) {
+  if (hasPadding(op)) {
+    return getPaddedInput<StdIndexedValue>(op.input(), inputIndices,
+                                           /*Pad every dimension*/ {});
+  }
+  IndexedValueType input(op.input());
+  return input(inputIndices);
+}
+
 template <typename IndexedValueType>
 void emitScalarImplementation(ArrayRef<Value> allIvs, PoolingMaxOp op) {
   InputAndOutputIndices indices = getInputAndOutputIndices(allIvs, op);
   // Emit scalar form.
   IndexedValueType output(op.output());
-  IndexedValueType input(op.input());
   Value lhs = output(indices.outputs);
-  Value rhs = input(indices.inputs);
+  Value rhs = getPoolingInput<IndexedValueType>(op, indices.inputs);
   using edsc::op::sgt;
   Value maxValue = std_select(sgt(lhs, rhs), lhs, rhs);
   output(indices.outputs) = maxValue;
@@ -402,7 +424,7 @@ void emitScalarImplementation(ArrayRef<Value> allIvs, PoolingMinOp op) {
   IndexedValueType output(op.output());
   IndexedValueType input(op.input());
   Value lhs = output(indices.outputs);
-  Value rhs = input(indices.inputs);
+  Value rhs = getPoolingInput<IndexedValueType>(op, indices.inputs);
   using edsc::op::slt;
   Value minValue = std_select(slt(lhs, rhs), lhs, rhs);
   output(indices.outputs) = minValue;
@@ -410,10 +432,11 @@ void emitScalarImplementation(ArrayRef<Value> allIvs, PoolingMinOp op) {
 template <typename IndexedValueType>
 void emitScalarImplementation(ArrayRef<Value> allIvs, PoolingSumOp op) {
   auto indices = getInputAndOutputIndices(allIvs, op);
-  IndexedValueType input(op.input()), output(op.output());
+  IndexedValueType output(op.output());
 
   // Emit scalar form.
-  output(indices.outputs) += input(indices.inputs);
+  output(indices.outputs) +=
+      getPoolingInput<IndexedValueType>(op, indices.inputs);
 }
 /// Emits the MLIR for the scalar part of the indexed generic op by:
 ///   1. Emitting load ops for each input and output view in order. This is

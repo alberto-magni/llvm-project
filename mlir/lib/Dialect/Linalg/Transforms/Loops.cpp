@@ -299,7 +299,7 @@ void emitScalarImplementation(ArrayRef<Value> allIvs, FillOp fillOp) {
 // is needed e.g. the non-spatial dimensions for convolutions.
 template <typename IndexedValueType>
 Value getPaddedInput(Value input, ArrayRef<Value> indices,
-                     ArrayRef<int> skipPadding) {
+                     ArrayRef<int> skipPadding, Value padValue) {
   // TODO: add a level of indirection to linalg.generic.
 
   IndexedValueType indexedInput(input);
@@ -336,12 +336,9 @@ Value getPaddedInput(Value input, ArrayRef<Value> indices,
     clampedImIdx.push_back(affine_max(dim.getType(), maxMap, ValueRange{dim}));
   }
 
-  auto &b = ScopedContext::getBuilderRef();
-  Type type = input.getType().cast<MemRefType>().getElementType();
-  Value zero = std_constant(type, b.getZeroAttr(type));
   Value readInput = indexedInput(clampedImIdx);
   return conds.empty() ? readInput
-                       : (Value)std_select(conds.back(), zero, readInput);
+                       : (Value)std_select(conds.back(), padValue, readInput);
 }
 
 /// Returns true is `convOp` has a non-zero padding.
@@ -375,10 +372,13 @@ static void emitScalarImplementation(ArrayRef<Value> allIvs, ConvOp convOp) {
   // which is not allowed by affine.load. Override to use an StdIndexedValue
   // when there is non-zero padding.
   if (hasPadding(convOp)) {
+    auto &b = ScopedContext::getBuilderRef();
+    Type type = convOp.input().getType().cast<MemRefType>().getElementType();
+    Value zero = std_constant(type, b.getZeroAttr(type));
     Value paddedInput = getPaddedInput<StdIndexedValue>(
         convOp.input(), imIdx,
         /* Only need to pad the window dimensions */
-        {0, static_cast<int>(imIdx.size()) - 1});
+        {0, static_cast<int>(imIdx.size()) - 1}, zero);
     O(oIdx) += F(fIdx) * paddedInput;
   } else {
     IndexedValueType I(convOp.input());
@@ -395,11 +395,54 @@ static bool hasPadding(PoolingOp poolingOp) {
   return false;
 }
 
+static APInt getPadValue(PoolingMaxOp, IntegerType intType) {
+  if (intType.isSigned()) {
+    return APInt::getSignedMinValue(intType.getWidth());
+  }
+  return APInt::getMinValue(intType.getWidth());
+}
+
+static APInt getPadValue(PoolingMinOp, IntegerType intType) {
+  if (intType.isSigned()) {
+    return APInt::getSignedMaxValue(intType.getWidth());
+  }
+  return APInt::getMaxValue(intType.getWidth());
+}
+
+static APInt getPadValue(PoolingSumOp, IntegerType intType) {
+  return APInt(intType.getWidth(), 0);
+}
+
+static APFloat getPadValue(PoolingMaxOp, FloatType floatType) {
+  return APFloat::getLargest(floatType.getFloatSemantics(), true);
+}
+
+static APFloat getPadValue(PoolingMinOp, FloatType floatType) {
+  return APFloat::getLargest(floatType.getFloatSemantics(), false);
+}
+
+static APFloat getPadValue(PoolingSumOp, FloatType floatType) {
+  return APFloat::getZero(floatType.getFloatSemantics());
+}
+
+template <typename PoolingOp>
+static Attribute getPadValueAttr(PoolingOp op, Type type) {
+  auto &b = ScopedContext::getBuilderRef();
+  if (type.isa<FloatType>())
+    return b.getFloatAttr(type, getPadValue(op, type.cast<FloatType>()));
+  if (auto integerType = type.dyn_cast<IntegerType>())
+    return b.getIntegerAttr(type, getPadValue(op, type.cast<IntegerType>()));
+  return {};
+}
+
 template <typename IndexedValueType, typename PoolingOp>
 static Value getPoolingInput(PoolingOp op, ArrayRef<Value> inputIndices) {
   if (hasPadding(op)) {
+    Type type = op.input().getType().template cast<MemRefType>().getElementType();
+    Value padValue = std_constant(type, getPadValueAttr(op, type));
     return getPaddedInput<StdIndexedValue>(op.input(), inputIndices,
-                                           /*Pad every dimension*/ {});
+                                           /*Pad every dimension*/ {},
+                                           padValue);
   }
   IndexedValueType input(op.input());
   return input(inputIndices);
